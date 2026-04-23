@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#110E0C">
+<title>AberScan</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--sans:'DM Sans',sans-serif;--mono:'Space Mono',monospace;--accent:#8B2942;--al:#A83355;--bg:#110E0C;--text:#F5F0EB;--muted:#8B7B72;--dim:#6B5E55}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--sans)}
+@keyframes scanLine{0%{top:0}100%{top:calc(100% - 2px)}}
+@keyframes slideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel">
+const {useState,useRef,useCallback,useEffect}=React;
+
+const APP_VERSION='5.0.0';
+(()=>{
+  const s=localStorage.getItem('aberscan_version');
+  if(s&&s!==APP_VERSION){localStorage.setItem('aberscan_version',APP_VERSION);if(typeof caches!=='undefined')caches.keys().then(k=>Promise.all(k.map(c=>caches.delete(c))));window.location.reload(true);return;}
+  localStorage.setItem('aberscan_version',APP_VERSION);
+})();
+
+function getApiKey(){return localStorage.getItem('aberscan_api_key');}
+function setApiKey(k){localStorage.setItem('aberscan_api_key',k);}
+function clearApiKey(){localStorage.removeItem('aberscan_api_key');}
+
+const CAT={beer:{icon:"🍺",c:"#E8A838"},cider:{icon:"🍏",c:"#8BC34A"},seltzer:{icon:"✨",c:"#00BCD4"},rtd:{icon:"🍹",c:"#FF7043"},wine:{icon:"🍷",c:"#C0392B"},spirit:{icon:"🥃",c:"#E67E22"},garnish:{icon:"🍋",c:"#2ECC71"},mixer:{icon:"🧃",c:"#3498DB"},"non-alcoholic":{icon:"🥤",c:"#1ABC9C"},food:{icon:"🍽️",c:"#E74C3C"},suppli:{icon:"📦",c:"#95A5A6"},other:{icon:"📋",c:"#7F8C8D"}};
+const catStyle=cat=>{const k=Object.keys(CAT).find(k=>cat.toLowerCase().includes(k));return CAT[k]||CAT.other;};
+
+function App(){
+  const videoRef=useRef(null),canvasRef=useRef(null),streamRef=useRef(null),scanRef=useRef(false);
+  const[apiKey,setAK]=useState(getApiKey()||"");
+  const[keyIn,setKeyIn]=useState("");
+  const[streaming,setStreaming]=useState(false);
+  const[scanning,setScanning]=useState(false);
+  const[results,setResults]=useState(null);
+  const[error,setError]=useState(null);
+  const[facing,setFacing]=useState("environment");
+  const[tab,setTab]=useState("camera");
+  const[collapsed,setCollapsed]=useState({});
+  const[torch,setTorch]=useState(false);
+
+  const startCam=useCallback(async f=>{
+    try{
+      setError(null);
+      if(streamRef.current)streamRef.current.getTracks().forEach(t=>t.stop());
+      const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:f||facing,width:{ideal:1920},height:{ideal:1080}},audio:false});
+      streamRef.current=s;
+      if(videoRef.current){videoRef.current.srcObject=s;await videoRef.current.play();}
+      setStreaming(true);
+    }catch{setError("Camera access denied.");}
+  },[facing]);
+
+  const stopCam=useCallback(()=>{
+    if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}
+    if(videoRef.current)videoRef.current.srcObject=null;
+    setStreaming(false);setTorch(false);
+  },[]);
+
+  const flipCam=useCallback(()=>{
+    const n=facing==="environment"?"user":"environment";
+    setFacing(n);if(streaming)startCam(n);
+  },[facing,streaming,startCam]);
+
+  const toggleTorch=useCallback(async()=>{
+    if(!streamRef.current)return;
+    const t=streamRef.current.getVideoTracks()[0];
+    if(!t)return;
+    try{const n=!torch;await t.applyConstraints({advanced:[{torch:n}]});setTorch(n);}catch{}
+  },[torch]);
+
+  const doScan=useCallback(async()=>{
+    if(!videoRef.current||!canvasRef.current||scanRef.current)return;
+    scanRef.current=true;setScanning(true);setError(null);setResults(null);
+    const v=videoRef.current,c=canvasRef.current;
+    if(v.videoWidth===0){setError("Camera not ready.");setScanning(false);scanRef.current=false;return;}
+
+    // Let camera settle
+    await new Promise(r=>setTimeout(r,400));
+
+    c.width=v.videoWidth;c.height=v.videoHeight;
+    c.getContext("2d").drawImage(v,0,0);
+    const b64=c.toDataURL("image/jpeg",0.9).split(",")[1];
+
+    try{
+      const r=await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",
+        headers:{"Content-Type":"application/json","x-api-key":getApiKey(),"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+        body:JSON.stringify({
+          model:"claude-sonnet-4-20250514",max_tokens:4000,
+          messages:[{role:"user",content:[
+            {type:"image",source:{type:"base64",media_type:"image/jpeg",data:b64}},
+            {type:"text",text:`Count every item in this image. This is a bar/restaurant inventory scan.
+
+For each item: identify the product name, container type, and count. Group by category.
+
+Categories: Beer, Ciders, Seltzers, RTD/Cocktails, Wine, Spirits, Garnishes, Mixers, Non-Alcoholic, Food, Supplies, Other
+
+Important:
+- Count ALL visible items individually.
+- Each distinct product = own line.
+- Same product, different container = separate lines.
+- Read labels carefully for brand names. If unreadable, describe by color/shape.
+- For garnishes, note dates or condition if visible.
+- For spirits, note fill level if visible.
+
+Respond with JSON only, no markdown:
+{"categories":[{"category":"Beer","items":[{"product":"Coors Light","type":"can","count":4,"details":"12oz"}]}],"total":4,"notes":""}`},
+          ]}],
+        }),
+      });
+      if(!r.ok){const e=await r.json().catch(()=>({}));setError(r.status===401?"Invalid API key.":r.status===429?"Rate limited.":e.error?.message||`Error ${r.status}`);setScanning(false);scanRef.current=false;return;}
+      const d=await r.json();
+      const txt=(d.content||[]).map(c=>c.text||"").join("");
+      if(!txt.trim()){setError("Empty response.");setScanning(false);scanRef.current=false;return;}
+      let p=null;
+      try{p=JSON.parse(txt.replace(/```json\s*/g,"").replace(/```\s*/g,"").trim());}catch{}
+      if(!p){let s=-1,dep=0,e=-1;for(let i=0;i<txt.length;i++){if(txt[i]==='{'){if(dep===0)s=i;dep++;}else if(txt[i]==='}'){dep--;if(dep===0&&s>=0){e=i;break;}}}if(s>=0&&e>s)try{p=JSON.parse(txt.substring(s,e+1));}catch{}}
+      if(!p||!Array.isArray(p.categories)){setError("Couldn't parse results.");setScanning(false);scanRef.current=false;return;}
+      const cats=p.categories.map(g=>{const items=(g.items||[]).map(i=>({product:i.product||"Unknown",type:i.type||"item",count:typeof i.count==="number"?i.count:parseInt(i.count)||0,details:i.details||""}));return{category:g.category||"Other",items,subtotal:items.reduce((s,i)=>s+i.count,0)};}).filter(g=>g.items.length>0);
+      setResults({categories:cats,total:cats.reduce((s,g)=>s+g.subtotal,0),notes:p.notes||""});
+      setTab("results");
+    }catch(e){console.error(e);setError("Scan failed.");}
+    finally{setScanning(false);scanRef.current=false;}
+  },[]);
+
+  useEffect(()=>()=>stopCam(),[stopCam]);
+
+  // API Key screen
+  if(!apiKey)return(
+    <div style={S.root}><div style={{flex:1,display:"flex",flexDirection:"column",justifyContent:"center",alignItems:"center",padding:"0 24px"}}>
+      <div style={{width:36,height:36,borderRadius:"50%",background:"var(--accent)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontFamily:"Georgia,serif",fontWeight:700,fontStyle:"italic",color:"#FFF",border:"2px solid rgba(255,255,255,0.15)",marginBottom:14}}>A</div>
+      <div style={{display:"flex",alignItems:"baseline",marginBottom:24}}><span style={{fontFamily:"'Playfair Display',serif",fontSize:26,fontWeight:800,color:"#F5F0EB"}}>Aber</span><span style={{fontFamily:"var(--mono)",fontSize:21,fontWeight:700,color:"var(--al)"}}>Scan</span></div>
+      <div style={{fontSize:13,color:"var(--muted)",marginBottom:16,textAlign:"center"}}>Enter API key to get started</div>
+      <input type="password" value={keyIn} onChange={e=>setKeyIn(e.target.value)} placeholder="sk-ant-..." style={{width:"100%",maxWidth:320,padding:"14px 16px",background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,color:"var(--text)",fontFamily:"var(--mono)",fontSize:13,outline:"none",marginBottom:12}} onKeyDown={e=>{if(e.key==="Enter"&&keyIn.trim()){setApiKey(keyIn.trim());setAK(keyIn.trim());}}}/>
+      <button onClick={()=>{if(keyIn.trim()){setApiKey(keyIn.trim());setAK(keyIn.trim());}}} style={{width:"100%",maxWidth:320,padding:"14px",background:"linear-gradient(135deg,var(--accent),var(--al))",border:"none",borderRadius:12,color:"#FFF",fontSize:15,fontWeight:700,cursor:"pointer",minHeight:48}}>Connect</button>
+      <div style={{fontFamily:"var(--mono)",fontSize:9,color:"var(--dim)",marginTop:12}}>Key stored locally only</div>
+    </div></div>
+  );
+
+  return(
+    <div style={S.root}>
+      <div style={S.hdr}>
+        <div style={{display:"flex",alignItems:"center",gap:9}}>
+          <div style={{width:32,height:32,borderRadius:"50%",background:"#110E0C",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,fontFamily:"Georgia,serif",fontWeight:700,fontStyle:"italic",color:"#FFF",border:"3px solid var(--accent)"}}>A</div>
+          <div style={{display:"flex",alignItems:"baseline"}}><span style={{fontFamily:"'Playfair Display',serif",fontSize:17,fontWeight:800,color:"#F5F0EB"}}>Aber</span><span style={{fontFamily:"var(--mono)",fontSize:14,fontWeight:700,color:"var(--al)"}}>Scan</span></div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <button onClick={()=>{if(typeof caches!=='undefined')caches.keys().then(k=>Promise.all(k.map(c=>caches.delete(c))));window.location.reload(true);}} style={{display:"flex",alignItems:"center",gap:4,background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,padding:"5px 10px",cursor:"pointer",color:"#8B7B72",minHeight:32}}><span style={{fontFamily:"var(--mono)",fontSize:9}}>v{APP_VERSION}</span><span style={{fontSize:12}}>🔄</span></button>
+          <button onClick={()=>{clearApiKey();setAK("");}} style={{background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#8B7B72",fontSize:14,cursor:"pointer",padding:"5px 8px",minHeight:32,display:"flex",alignItems:"center"}}>⚙️</button>
+        </div>
+      </div>
+
+      <div style={S.tabs}>
+        <button style={{...S.tab,...(tab==="camera"?S.tabOn:{})}} onClick={()=>setTab("camera")}>📷 Camera</button>
+        <button style={{...S.tab,...(tab==="results"?S.tabOn:{})}} onClick={()=>setTab("results")}>📊 Results{results&&<span style={S.badge}>{results.total}</span>}</button>
+      </div>
+
+      {tab==="camera"&&<div style={S.page}>
+        <div style={S.vf}>
+          <video ref={videoRef} style={S.vid} playsInline muted/>
+          <canvas ref={canvasRef} style={{display:"none"}}/>
+          {scanning&&<div style={S.overlay}><div style={S.line}/><div style={{position:"absolute",bottom:16,left:0,right:0,textAlign:"center"}}><span style={{fontFamily:"var(--mono)",fontSize:11,color:"#FFF",background:"rgba(0,0,0,0.7)",padding:"6px 14px",borderRadius:8}}>🔍 Scanning...</span></div></div>}
+          {!streaming&&<div style={S.ph}><span style={{fontSize:44,marginBottom:10}}>📷</span><span style={{fontSize:15,color:"#8899AA",fontWeight:600}}>Tap to start camera</span><span style={{fontFamily:"var(--mono)",fontSize:10,color:"#556677",marginTop:3}}>Point at shelves, fridges, or bar</span></div>}
+          {streaming&&!scanning&&[["top","left"],["top","right"],["bottom","left"],["bottom","right"]].map(([v,h])=><div key={v+h} style={{position:"absolute",[v]:10,[h]:10,width:24,height:24,borderRadius:2,[`border${v[0].toUpperCase()+v.slice(1)}`]:"3px solid var(--al)",[`border${h[0].toUpperCase()+h.slice(1)}`]:"3px solid var(--al)"}}/>)}
+        </div>
+        <div style={S.ctrls}>
+          {!streaming?<button style={S.big} onClick={()=>startCam()}>Start Camera</button>:(
+            <>
+              <button style={S.circ} onClick={flipCam}>🔄</button>
+              <button style={{...S.circ,...(torch?{background:"rgba(241,196,15,0.2)",borderColor:"rgba(241,196,15,0.4)",color:"#F1C40F"}:{})}} onClick={toggleTorch}>{torch?"🔦":"💡"}</button>
+              <button style={{...S.big,flex:1,opacity:scanning?.5:1}} onClick={doScan} disabled={scanning}>{scanning?"🔍 Scanning...":"⊙ Scan"}</button>
+              <button style={S.circ} onClick={stopCam}>✕</button>
+            </>
+          )}
+        </div>
+        {error&&<div style={S.err}>⚠️ {error}</div>}
+      </div>}
+
+      {tab==="results"&&<div style={S.page}>
+        {!results?<div style={S.empty}><span style={{fontSize:40}}>📷</span><span style={{color:"#667788",fontSize:14}}>No scan yet</span></div>:(
+          <>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <span style={{fontFamily:"var(--mono)",fontSize:9,color:"#667788"}}>Current scan</span>
+              <button onClick={()=>{setResults(null);setTab("camera");}} style={{fontFamily:"var(--mono)",fontSize:10,color:"#E74C3C",background:"rgba(231,76,60,0.08)",border:"1px solid rgba(231,76,60,0.2)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontWeight:700,minHeight:32}}>✕ Clear</button>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:"rgba(255,255,255,.03)",borderRadius:14,padding:"12px 14px",marginBottom:10,border:"1px solid rgba(255,255,255,.05)"}}>
+              <span style={{fontFamily:"var(--mono)",fontSize:10,color:"#8B7B72",textTransform:"uppercase",letterSpacing:1.8}}>Scan Results</span>
+              <div style={{display:"flex",alignItems:"baseline",gap:4}}><span style={{fontFamily:"var(--mono)",fontSize:30,fontWeight:700,color:"var(--al)"}}>{results.total}</span><span style={{fontFamily:"var(--mono)",fontSize:11,color:"#667788"}}>items</span></div>
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>
+              {results.categories.map(g=>{const s=catStyle(g.category);return<span key={g.category} style={{fontFamily:"var(--mono)",fontSize:10,padding:"3px 8px",borderRadius:6,background:s.c+"18",color:s.c,fontWeight:600}}>{s.icon} {g.subtotal} {g.category}</span>;})}
+            </div>
+            {results.categories.map((g,gi)=>{const st=catStyle(g.category);const cl=collapsed[g.category];return(
+              <div key={g.category} style={{background:"rgba(255,255,255,0.02)",borderRadius:12,overflow:"hidden",border:"1px solid rgba(255,255,255,0.04)",marginBottom:8,animation:"slideUp .3s ease both",animationDelay:`${gi*50}ms`}}>
+                <button style={{width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",padding:"11px 12px",background:"transparent",border:"none",cursor:"pointer",color:"inherit",minHeight:44}} onClick={()=>setCollapsed(p=>({...p,[g.category]:!p[g.category]}))}>
+                  <div style={{display:"flex",alignItems:"center",gap:7}}><span style={{fontSize:18}}>{st.icon}</span><span style={{fontSize:14,fontWeight:700,color:"#E8EEF4"}}>{g.category}</span><span style={{fontFamily:"var(--mono)",fontSize:11,fontWeight:700,padding:"1px 7px",borderRadius:5,background:st.c+"18",color:st.c}}>{g.subtotal}</span></div>
+                  <span style={{color:"#556677",fontSize:13,transform:cl?"rotate(-90deg)":"rotate(0)",transition:"transform .15s"}}>▾</span>
+                </button>
+                {!cl&&<div style={{padding:"0 8px 8px"}}>{g.items.map((item,ii)=>(
+                  <div key={ii} style={{display:"flex",alignItems:"flex-start",padding:"10px 8px",marginBottom:4,gap:8,borderLeft:`3px solid ${st.c}33`,borderRadius:10,background:"rgba(255,255,255,0.02)"}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}><span style={{fontSize:13,fontWeight:600,color:"#EDE5DD"}}>{item.product}</span><span style={{fontFamily:"var(--mono)",fontSize:9,padding:"1px 6px",borderRadius:4,border:`1px solid ${st.c}40`,background:`${st.c}20`,color:st.c,textTransform:"uppercase",fontWeight:700}}>{item.type}</span></div>
+                      {item.details&&<div style={{fontSize:11,color:"#8B7B72",marginTop:3}}>{item.details}</div>}
+                    </div>
+                    <span style={{fontFamily:"var(--mono)",fontSize:22,fontWeight:700,color:st.c,flexShrink:0}}>{item.count}</span>
+                  </div>
+                ))}</div>}
+              </div>
+            );})}
+            {results.notes&&results.notes!=="No inventory items detected"&&<div style={{marginTop:12,padding:10,background:"rgba(255,255,255,0.02)",borderRadius:8,border:"1px solid rgba(255,255,255,0.04)",display:"flex",flexDirection:"column"}}><span style={{fontFamily:"var(--mono)",fontSize:9,color:"#667788",textTransform:"uppercase",letterSpacing:1.5,marginBottom:3}}>Notes</span><span style={{fontSize:12,color:"#AABBCC",lineHeight:1.4}}>{results.notes}</span></div>}
+          </>
+        )}
+      </div>}
+    </div>
+  );
+}
+
+const S={
+  root:{minHeight:"100dvh",background:"#110E0C",fontFamily:"var(--sans)",color:"#F5F0EB",display:"flex",flexDirection:"column",maxWidth:480,margin:"0 auto"},
+  hdr:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"max(14px,env(safe-area-inset-top,14px)) 16px 6px",position:"sticky",top:0,zIndex:20,background:"#110E0C"},
+  tabs:{display:"flex",padding:"0 12px 6px",gap:4,position:"sticky",top:52,zIndex:20,background:"#110E0C"},
+  tab:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"10px 4px",background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.05)",borderRadius:10,color:"#6B5E55",fontFamily:"var(--sans)",fontSize:13,fontWeight:600,cursor:"pointer",minHeight:44},
+  tabOn:{background:"rgba(139,41,66,.12)",borderColor:"rgba(139,41,66,.3)",color:"var(--al)"},
+  badge:{fontFamily:"var(--mono)",fontSize:9,fontWeight:700,color:"#FFF",background:"var(--accent)",padding:"1px 6px",borderRadius:8,marginLeft:4},
+  page:{flex:1,padding:"8px 12px 32px",display:"flex",flexDirection:"column"},
+  vf:{width:"100%",aspectRatio:"4/3",background:"#1A1411",borderRadius:16,overflow:"hidden",position:"relative",border:"1px solid rgba(255,255,255,.06)"},
+  vid:{width:"100%",height:"100%",objectFit:"cover",display:"block"},
+  ph:{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"},
+  overlay:{position:"absolute",inset:0,background:"rgba(139,41,66,.06)"},
+  line:{position:"absolute",left:0,right:0,height:2,background:"linear-gradient(90deg,transparent,var(--al),transparent)",boxShadow:"0 0 16px var(--accent)",animation:"scanLine 1.8s ease-in-out infinite alternate"},
+  ctrls:{display:"flex",gap:10,marginTop:10},
+  big:{width:"100%",padding:"14px 20px",background:"linear-gradient(135deg,var(--accent),var(--al))",border:"none",borderRadius:12,color:"#FFF",fontFamily:"var(--sans)",fontSize:15,fontWeight:700,cursor:"pointer",minHeight:48},
+  circ:{width:48,height:48,minWidth:48,background:"rgba(255,255,255,.06)",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,color:"#F5F0EB",fontSize:18,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"},
+  err:{marginTop:8,background:"rgba(231,76,60,.1)",border:"1px solid rgba(231,76,60,.25)",borderRadius:10,padding:"10px 14px",fontSize:12,color:"#E74C3C"},
+  empty:{display:"flex",flexDirection:"column",alignItems:"center",padding:"40px 0",gap:6},
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

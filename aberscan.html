@@ -1,0 +1,1191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#110E0C">
+<title>AberScan</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--sans:'DM Sans',sans-serif;--mono:'Space Mono',monospace;--accent:#8B2942;--al:#A83355;--bg:#110E0C;--text:#F5F0EB;--muted:#8B7B72;--dim:#6B5E55}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--sans)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+@keyframes slideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@keyframes scanLine{0%{top:0}100%{top:calc(100% - 2px)}}
+@keyframes alertFlash{0%,100%{opacity:1}50%{opacity:.8}}
+input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel">
+const APP_VERSION = '3.0.0';
+(()=>{
+  const saved = localStorage.getItem('aberscan_version');
+  if(saved && saved !== APP_VERSION){
+    localStorage.setItem('aberscan_version', APP_VERSION);
+    window.location.reload(true);
+    return;
+  }
+  localStorage.setItem('aberscan_version', APP_VERSION);
+})();
+
+const {useState, useRef, useCallback, useEffect} = React;
+
+function getApiKey(){ return localStorage.getItem('aberscan_api_key'); }
+function setApiKey(k){ localStorage.setItem('aberscan_api_key', k); }
+function clearApiKey(){ localStorage.removeItem('aberscan_api_key'); }
+
+/* ── CONFIG ── */
+const CAT = {
+  beer:       { icon: "🍺", c: "#E8A838", bg: "rgba(232,168,56,0.10)" },
+  cider:      { icon: "🍏", c: "#8BC34A", bg: "rgba(139,195,74,0.10)" },
+  seltzer:    { icon: "✨", c: "#00BCD4", bg: "rgba(0,188,212,0.10)" },
+  rtd:        { icon: "🍹", c: "#FF7043", bg: "rgba(255,112,67,0.10)" },
+  wine:       { icon: "🍷", c: "#C0392B", bg: "rgba(192,57,43,0.10)" },
+  spirits:    { icon: "🥃", c: "#E67E22", bg: "rgba(230,126,34,0.10)" },
+  garnishes:  { icon: "🍋", c: "#2ECC71", bg: "rgba(46,204,113,0.10)" },
+  mixers:     { icon: "🧃", c: "#3498DB", bg: "rgba(52,152,219,0.10)" },
+  "non-alcoholic": { icon: "🥤", c: "#1ABC9C", bg: "rgba(26,188,156,0.10)" },
+  food:       { icon: "🍽️", c: "#E74C3C", bg: "rgba(231,76,60,0.10)" },
+  supplies:   { icon: "📦", c: "#95A5A6", bg: "rgba(149,165,166,0.10)" },
+  other:      { icon: "📋", c: "#7F8C8D", bg: "rgba(127,140,141,0.10)" },
+};
+const TI = { can:"🥫",bottle:"🍾",keg:"🛢️",box:"📦",bag:"🛍️",container:"🫙",jar:"🫙",handle:"🍾",mini:"🍾",case:"📦",tap:"🚰",growler:"🍺",crowler:"🥫" };
+const catStyle = (cat) => { const k = Object.keys(CAT).find(k => cat.toLowerCase().includes(k)); return CAT[k] || CAT.other; };
+const typeIcon = (t) => { const k = Object.keys(TI).find(k => (t||"").toLowerCase().includes(k)); return TI[k] || "•"; };
+
+/* ── FRESHNESS ── */
+function parseFreshness(item) {
+  const d = item.details || "";
+  const cat = (item._cat || "").toLowerCase();
+  const isPerishable = ["garnishes","food","mixers"].some(c => cat.includes(c));
+  const dateMatch = d.match(/(?:dated?|exp|expires?|use.by|best.by|prepared?)\\s*:?\\s*(\\d{1,2})[\\\/\\-.](\\d{1,2})(?:[\\\/\\-.](\\d{2,4}))?/i);
+  const badCond = d.match(/\\b(browning|wilting|soft|old|expired|spoiled|bad|mushy|slimy|moldy)\\b/i);
+  const goodCond = d.match(/\\b(fresh|good|crisp|firm)\\b/i);
+  let status = "ok", label = null;
+
+  if (badCond) { status = "danger"; label = badCond[1]; }
+  else if (dateMatch) {
+    const m = parseInt(dateMatch[1]), day = parseInt(dateMatch[2]);
+    const yr = dateMatch[3] ? parseInt(dateMatch[3]) : new Date().getFullYear();
+    const fullYr = yr < 100 ? 2000 + yr : yr;
+    const diff = Math.floor((new Date() - new Date(fullYr, m-1, day)) / 86400000);
+    if (isPerishable) {
+      if (diff > 3) { status = "expired"; label = `${diff}d old`; }
+      else if (diff > 1) { status = "danger"; label = `${diff}d old`; }
+      else if (diff >= 0) { status = "warning"; label = diff === 0 ? "today" : "1d old"; }
+      else { status = "ok"; label = "fresh"; }
+    } else if (diff > 0 && d.toLowerCase().includes("exp")) { status = "expired"; label = "past exp"; }
+  } else if (isPerishable && !goodCond) { status = "warning"; label = "no date"; }
+
+  return { status, label };
+}
+
+const FC = {
+  ok:      { bg: "transparent", border: "transparent", text: "#2ECC71", icon: "" },
+  warning: { bg: "rgba(241,196,15,0.12)", border: "rgba(241,196,15,0.35)", text: "#F1C40F", icon: "⚠️" },
+  danger:  { bg: "rgba(231,76,60,0.12)", border: "rgba(231,76,60,0.35)", text: "#E74C3C", icon: "🔴" },
+  expired: { bg: "rgba(231,76,60,0.18)", border: "rgba(231,76,60,0.5)", text: "#E74C3C", icon: "❌" },
+};
+
+/* ── JSON EXTRACTION (bulletproof) ── */
+function extractJSON(text) {
+  // Try 1: Direct parse (clean response)
+  const stripped = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+  try { return JSON.parse(stripped); } catch {}
+
+  // Try 2: Find the outermost { ... } block using bracket counting
+  let start = -1, depth = 0, end = -1;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (text[i] === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) { end = i; break; }
+    }
+  }
+  if (start >= 0 && end > start) {
+    try { return JSON.parse(text.substring(start, end + 1)); } catch {}
+  }
+
+  // Try 3: Aggressive cleanup — strip control chars, fix trailing commas
+  if (start >= 0 && end > start) {
+    let chunk = text.substring(start, end + 1);
+    chunk = chunk.replace(/[\x00-\x1f]/g, " "); // strip control chars
+    chunk = chunk.replace(/,\s*([\]}])/g, "$1"); // trailing commas
+    chunk = chunk.replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":'); // unquoted keys
+    try { return JSON.parse(chunk); } catch {}
+  }
+
+  return null;
+}
+
+/* ── COMPONENT ── */
+function App() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [streaming, setStreaming] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanStage, setScanStage] = useState(""); // "capturing" | "analyzing" | ""
+  const [results, setResults] = useState(null);
+  const [error, setError] = useState(null);
+  const [facingMode, setFacingMode] = useState("environment");
+  const streamRef = useRef(null);
+  const scanningRef = useRef(false);
+  const [collapsed, setCollapsed] = useState({});
+  const [pars, setPars] = useState({});
+  const [editingPar, setEditingPar] = useState(null);
+  const [parInput, setParInput] = useState("");
+  const [tab, setTab] = useState("camera");
+  const [apiKey, setApiKeyState] = useState(getApiKey() || "");
+  const [keyInput, setKeyInput] = useState("");
+  const itemRefs = useRef({});
+  const [showReport, setShowReport] = useState(false);
+  const [debugImg, setDebugImg] = useState(null);
+  const [scanHistory, setScanHistory] = useState([]);
+  const [viewingHistory, setViewingHistory] = useState(null);
+
+  // Zones
+  const DEFAULT_ZONES = ["Front Bar","Walk-in Cooler","Kitchen","Upstairs Bar"];
+  const ZONE_ICONS = {"front bar":"🍺","walk-in cooler":"🧊","kitchen":"🍳","upstairs bar":"🍸"};
+  const zoneIcon = (z) => ZONE_ICONS[(z||"").toLowerCase()] || "📍";
+  const [zones, setZones] = useState(DEFAULT_ZONES);
+  const [activeZone, setActiveZone] = useState(null);
+  const [zoneScans, setZoneScans] = useState({});
+
+  const parKey = (item) => (item.product||"").toLowerCase() + "|" + (item.type||"").toLowerCase();
+
+  useEffect(() => {
+    try { const v = localStorage.getItem("aberscan_pars"); if (v) setPars(JSON.parse(v)); } catch {}
+    try { const v = localStorage.getItem("aberscan_history"); if (v) setScanHistory(JSON.parse(v)); } catch {}
+    try { const v = localStorage.getItem("aberscan_zones"); if (v) setZones(JSON.parse(v)); } catch {}
+    try { const v = localStorage.getItem("aberscan_zonescans"); if (v) setZoneScans(JSON.parse(v)); } catch {}
+  }, []);
+
+  const saveHistory = (newHistory) => {
+    setScanHistory(newHistory);
+    try { localStorage.setItem("aberscan_history", JSON.stringify(newHistory)); } catch {}
+  };
+  const saveZones = (z) => { setZones(z); try { localStorage.setItem("aberscan_zones", JSON.stringify(z)); } catch {} };
+  const saveZoneScans = (zs) => { setZoneScans(zs); try { localStorage.setItem("aberscan_zonescans", JSON.stringify(zs)); } catch {} };
+  const savePar = (key, val) => {
+    const next = { ...pars, [key]: val };
+    setPars(next);
+    try { localStorage.setItem("aberscan_pars", JSON.stringify(next)); } catch {}
+  };
+
+  const toggle = (cat) => setCollapsed(p => ({ ...p, [cat]: !p[cat] }));
+
+  const scrollToItem = (pk, catName) => {
+    setCollapsed(p => ({ ...p, [catName]: false }));
+    setTimeout(() => {
+      const el = itemRefs.current[pk];
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.style.transition = "box-shadow .2s";
+        el.style.boxShadow = "0 0 0 2px #E74C3C, 0 0 20px rgba(231,76,60,0.3)";
+        setTimeout(() => { el.style.boxShadow = "none"; }, 1500);
+      }
+    }, 100);
+  };
+
+  const startCamera = useCallback(async (facing) => {
+    try {
+      setError(null);
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: facing || facingMode, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
+      setStreaming(true);
+    } catch { setError("Camera access denied."); }
+  }, [facingMode]);
+
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setStreaming(false);
+  }, []);
+
+  const flipCamera = useCallback(() => {
+    const n = facingMode === "environment" ? "user" : "environment";
+    setFacingMode(n); if (streaming) startCamera(n);
+  }, [facingMode, streaming, startCamera]);
+
+  /* ── SINGLE SCAN — one API call ── */
+  const doScan = useCallback(async () => {
+    if (!videoRef.current || !canvasRef.current || scanningRef.current) return;
+    scanningRef.current = true;
+    setScanning(true);
+    setScanStage("capturing");
+    setError(null);
+
+    const v = videoRef.current, c = canvasRef.current;
+
+    if (v.videoWidth === 0 || v.videoHeight === 0) {
+      setError("Camera not ready — wait a moment and try again.");
+      setScanning(false); setScanStage(""); scanningRef.current = false;
+      return;
+    }
+
+    c.width = v.videoWidth; c.height = v.videoHeight;
+    c.getContext("2d").drawImage(v, 0, 0);
+    const dataUrl = c.toDataURL("image/jpeg", 0.85);
+    const b64 = dataUrl.split(",")[1];
+    setDebugImg(dataUrl);
+
+    // Black frame check
+    const imgData = c.getContext("2d").getImageData(0, 0, Math.min(c.width, 10), Math.min(c.height, 10));
+    const allBlack = imgData.data.every((v, i) => i % 4 === 3 ? true : v === 0);
+    if (allBlack) {
+      setError("Camera frame appears black — make sure camera is active and try again.");
+      setScanning(false); setScanStage(""); scanningRef.current = false;
+      return;
+    }
+
+    setScanStage("analyzing");
+
+    try {
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": getApiKey(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 4000,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
+              { type: "text", text: `You are an inventory scanner for a bar called The Aberdeen Tap. Look at this image carefully and count every visible item.
+
+INSTRUCTIONS:
+1. Scan left to right, shelf by shelf, section by section.
+2. Count each individual item — each can, bottle, keg, box, etc. is 1 unit.
+3. If you see a group of identical items, count them individually.
+4. If you can read a label, use the exact product name. If you can't, describe it (e.g. "Unknown craft IPA", "Red can").
+5. Be conservative — only count what you can actually see. Do not guess at items hidden behind others.
+6. If the image is blurry, dark, or you can't identify items, set overall_confidence below 60 and explain in notes.
+
+Categories: Beer, Ciders, Seltzers, RTD/Cocktails, Wine, Spirits, Garnishes, Mixers, Non-Alcoholic, Food, Supplies, Other
+
+For "type" use: can, bottle, keg, box, bag, container, jar, handle, case, tap, growler, crowler
+
+Respond with ONLY this JSON — no other text before or after:
+{"categories":[{"category":"Beer","items":[{"product":"Coors Light","type":"can","count":4,"details":"12oz silver cans"}]}],"total":4,"overall_confidence":85,"review_flags":[],"notes":""}
+
+IMPORTANT:
+- "total" MUST equal the sum of all item counts across all categories.
+- "count" is the number of that specific product/type you can see.
+- "review_flags" is an array of strings noting anything uncertain.
+- Only include categories that have items. Do not include empty categories.
+- Respond with ONLY the JSON object. No markdown, no explanation.` },
+            ],
+          }],
+        }),
+      });
+
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        const msg = errData.error?.message || `HTTP ${resp.status}`;
+        if (resp.status === 401 || resp.status === 403) {
+          setError("Invalid API key. Tap ⚙️ to re-enter.");
+        } else if (resp.status === 429) {
+          setError("Rate limited — wait a moment and try again.");
+        } else if (resp.status >= 500) {
+          setError("API server error — try again in a few seconds.");
+        } else {
+          setError(`API error: ${msg}`);
+        }
+        setScanning(false); setScanStage(""); scanningRef.current = false;
+        return;
+      }
+
+      const data = await resp.json();
+      const txt = data.content?.map(c => c.text || "").join("") || "";
+
+      if (!txt.trim()) {
+        setError("Empty response from API — try again.");
+        setScanning(false); setScanStage(""); scanningRef.current = false;
+        return;
+      }
+
+      const parsed = extractJSON(txt);
+
+      if (!parsed || !Array.isArray(parsed.categories)) {
+        console.error("Failed to parse:", txt.substring(0, 500));
+        setError("Couldn't parse scan results. Try better lighting or a different angle.");
+        setScanning(false); setScanStage(""); scanningRef.current = false;
+        return;
+      }
+
+      // Normalize: ensure every category has subtotal, every item has count as number
+      const cats = (parsed.categories || []).map(g => {
+        const items = (g.items || []).map(i => ({
+          ...i,
+          count: typeof i.count === "number" ? i.count : parseInt(i.count) || 0,
+          product: i.product || "Unknown",
+          type: i.type || "item",
+        }));
+        return {
+          category: g.category || "Other",
+          items,
+          subtotal: items.reduce((s, i) => s + i.count, 0),
+        };
+      }).filter(g => g.items.length > 0);
+
+      const computedTotal = cats.reduce((s, g) => s + g.subtotal, 0);
+
+      const scanResult = {
+        categories: cats,
+        total: computedTotal,
+        notes: parsed.notes || "",
+        confidence: typeof parsed.overall_confidence === "number" ? parsed.overall_confidence : null,
+        reviewFlags: Array.isArray(parsed.review_flags) ? parsed.review_flags : [],
+      };
+
+      setResults(scanResult);
+      setTab("results");
+      setViewingHistory(null);
+
+      // Save to zone
+      if (activeZone) {
+        const zoneResult = { categories: cats, total: computedTotal, notes: parsed.notes || "", timestamp: new Date().toISOString() };
+        setZoneScans(prev => {
+          const next = { ...prev, [activeZone]: zoneResult };
+          saveZoneScans(next);
+          return next;
+        });
+      }
+
+      // Save to history
+      const scanRecord = {
+        id: Date.now(),
+        timestamp: new Date().toISOString(),
+        zone: activeZone || null,
+        categories: cats,
+        total: computedTotal,
+        notes: parsed.notes || "",
+      };
+      setScanHistory(prev => {
+        const next = [scanRecord, ...prev].slice(0, 50);
+        saveHistory(next);
+        return next;
+      });
+
+    } catch (e) {
+      console.error("Scan error:", e);
+      if (e.name === "TypeError" && e.message.includes("fetch")) {
+        setError("Network error — check your connection.");
+      } else {
+        setError("Scan failed — try again.");
+      }
+    } finally {
+      setScanning(false);
+      setScanStage("");
+      scanningRef.current = false;
+    }
+  }, [activeZone]);
+
+  useEffect(() => () => { stopCamera(); }, [stopCamera]);
+
+  // Compute alerts
+  const alerts = [];
+  if (results) {
+    (results.categories || []).forEach(g => {
+      (g.items || []).forEach(item => {
+        const pk = parKey(item);
+        const par = pars[pk];
+        const fresh = parseFreshness({ ...item, _cat: g.category });
+        if (par && item.count < par) alerts.push({ ...item, _cat: g.category, alertType: "low", par, fresh, pk });
+        if (fresh.status !== "ok") alerts.push({ ...item, _cat: g.category, alertType: "fresh", fresh, pk });
+      });
+    });
+  }
+  const seen = new Set();
+  const uniqAlerts = alerts.filter(a => { const k = a.pk + a.alertType; if (seen.has(k)) return false; seen.add(k); return true; });
+  const lowAlerts = uniqAlerts.filter(a => a.alertType === "low");
+  const freshAlerts = uniqAlerts.filter(a => a.alertType === "fresh");
+
+  const clearScan = () => { setResults(null); setTab("camera"); };
+
+  // Full inventory: merge all zone scans
+  const getFullInventory = () => {
+    const allItems = new Map();
+    Object.values(zoneScans).forEach(zs => {
+      (zs.categories || []).forEach(g => {
+        (g.items || []).forEach(it => {
+          const pk = (it.product||"").toLowerCase() + "|" + (it.type||"");
+          const prev = allItems.get(pk);
+          if (!prev || it.count > prev.count) {
+            allItems.set(pk, { ...it, _cat: g.category });
+          }
+        });
+      });
+    });
+    // Group by category
+    const catMap = new Map();
+    allItems.forEach(item => {
+      const ck = item._cat;
+      if (!catMap.has(ck)) catMap.set(ck, { category: ck, items: [] });
+      const { _cat, ...rest } = item;
+      catMap.get(ck).items.push(rest);
+    });
+    const cats = Array.from(catMap.values()).map(g => ({ ...g, subtotal: g.items.reduce((s, i) => s + i.count, 0) }));
+    if (cats.length === 0) return null;
+    return { categories: cats, total: cats.reduce((s, g) => s + g.subtotal, 0) };
+  };
+
+  // Reorder list
+  const getReorderList = () => {
+    const full = getFullInventory();
+    if (!full) return [];
+    const items = [];
+    (full.categories || []).forEach(g => {
+      (g.items || []).forEach(item => {
+        const pk = parKey(item);
+        const par = pars[pk];
+        if (par && item.count < par) {
+          items.push({ ...item, _cat: g.category, par, need: par - item.count, onHand: item.count });
+        }
+      });
+    });
+    return items.sort((a, b) => b.need - a.need);
+  };
+
+  const viewHistoryScan = (idx) => {
+    const scan = scanHistory[idx];
+    if (!scan) return;
+    setResults({ categories: scan.categories, total: scan.total, notes: scan.notes });
+    setViewingHistory(idx);
+    setTab("results");
+  };
+
+  /* ── API KEY SCREEN ── */
+  if (!apiKey) {
+    return (
+      <div style={{...S.root, justifyContent:"center", alignItems:"center", padding:"0 24px"}}>
+        <div style={{width:32,height:32,borderRadius:"50%",background:"var(--accent)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontFamily:"Georgia,serif",fontWeight:700,fontStyle:"italic",color:"#FFF",border:"2px solid rgba(255,255,255,0.15)",marginBottom:12}}>A</div>
+        <div style={{display:"flex",alignItems:"baseline",gap:0,marginBottom:24}}>
+          <span style={{fontFamily:"'Playfair Display',serif",fontSize:24,fontWeight:800,color:"#F5F0EB"}}>Aber</span>
+          <span style={{fontFamily:"var(--mono)",fontSize:20,fontWeight:700,color:"var(--al)"}}>Scan</span>
+        </div>
+        <div style={{fontFamily:"var(--sans)",fontSize:13,color:"var(--muted)",marginBottom:16,textAlign:"center"}}>Enter API key to get started</div>
+        <input type="password" value={keyInput} onChange={e => setKeyInput(e.target.value)} placeholder="sk-ant-..." style={{width:"100%",maxWidth:320,padding:"14px 16px",background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,color:"var(--text)",fontFamily:"var(--mono)",fontSize:13,outline:"none",marginBottom:12}} onKeyDown={e => { if(e.key==="Enter" && keyInput.trim()){ setApiKey(keyInput.trim()); setApiKeyState(keyInput.trim()); }}} />
+        <button onClick={() => { if(keyInput.trim()){ setApiKey(keyInput.trim()); setApiKeyState(keyInput.trim()); } }} style={{width:"100%",maxWidth:320,padding:"14px",background:"linear-gradient(135deg,var(--accent),var(--al))",border:"none",borderRadius:12,color:"#FFF",fontFamily:"var(--sans)",fontSize:15,fontWeight:700,cursor:"pointer",minHeight:48}}>Connect</button>
+        <div style={{fontFamily:"var(--mono)",fontSize:9,color:"var(--dim)",marginTop:12,textAlign:"center"}}>Key is stored locally on this device only</div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={S.root}>
+
+      {/* HEADER */}
+      <div style={S.header}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+          <div style={{ width: 32, height: 32, borderRadius: "50%", background: "#110E0C", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, fontFamily: "Georgia,serif", fontWeight: 700, fontStyle: "italic", color: "#FFF", border: "3px solid var(--accent)", boxShadow: "0 0 0 1px #6B1D32" }}>A</div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 0 }}>
+            <span style={{ fontFamily: "'Playfair Display',serif", fontSize: 17, fontWeight: 800, color: "#F5F0EB", letterSpacing: 0.2 }}>Aber</span>
+            <span style={{ fontFamily: "var(--mono)", fontSize: 14, fontWeight: 700, color: "var(--al)", letterSpacing: -0.5 }}>Scan</span>
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <button onClick={() => { if(typeof caches!=='undefined') caches.keys().then(k=>Promise.all(k.map(c=>caches.delete(c)))); window.location.reload(true); }} style={{ display:"flex", alignItems:"center", gap:5, background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:8, padding:"5px 10px", cursor:"pointer", color:"#8B7B72", minHeight:32 }}>
+            <span style={{ fontFamily:"var(--mono)", fontSize:9, letterSpacing:0.5 }}>v{APP_VERSION}</span>
+            <span style={{ fontSize:12 }}>🔄</span>
+          </button>
+          <button onClick={() => { clearApiKey(); setApiKeyState(""); }} style={{background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,color:"#8B7B72",fontSize:14,cursor:"pointer",padding:"5px 8px",minHeight:32,display:"flex",alignItems:"center"}}>⚙️</button>
+        </div>
+      </div>
+
+      {/* TAB BAR */}
+      <div style={S.tabBar}>
+        <button style={{ ...S.tabBtn, ...(tab==="camera"?S.tabAct:{}) }} onClick={() => setTab("camera")}>
+          <span style={{ fontSize: 16 }}>📷</span><span style={{ fontSize: 11, fontWeight: 600 }}>Camera</span>
+        </button>
+        <button style={{ ...S.tabBtn, ...(tab==="results"?S.tabAct:{}) }} onClick={() => { setViewingHistory(null); setTab("results"); }}>
+          <span style={{ fontSize: 16 }}>📊</span><span style={{ fontSize: 11, fontWeight: 600 }}>Results</span>
+          {results && <span style={{ ...S.tabBadge, background: uniqAlerts.length > 0 ? "#E74C3C" : "var(--accent)" }}>{uniqAlerts.length > 0 ? `⚠${uniqAlerts.length}` : results.total}</span>}
+        </button>
+        <button style={{ ...S.tabBtn, ...(tab==="history"?S.tabAct:{}) }} onClick={() => setTab("history")}>
+          <span style={{ fontSize: 16 }}>📅</span><span style={{ fontSize: 11, fontWeight: 600 }}>History</span>
+          {scanHistory.length > 0 && <span style={{ ...S.tabBadge, background: "var(--accent)" }}>{scanHistory.length}</span>}
+        </button>
+      </div>
+
+      {/* ═══ CAMERA ═══ */}
+      {tab === "camera" && (
+        <div style={S.page}>
+          {/* Zone Picker */}
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#8B7B72", textTransform: "uppercase", letterSpacing: 1.5 }}>Scanning zone</span>
+              {activeZone && <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--al)", fontWeight: 700 }}>{zoneIcon(activeZone)} {activeZone}</span>}
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {zones.map(z => (
+                <button key={z} onClick={() => setActiveZone(activeZone === z ? null : z)} style={{
+                  padding: "7px 12px", borderRadius: 8, fontFamily: "var(--sans)", fontSize: 12, fontWeight: 600, cursor: "pointer", minHeight: 34,
+                  background: activeZone === z ? "rgba(139,41,66,0.2)" : "rgba(255,255,255,0.04)",
+                  border: activeZone === z ? "1px solid rgba(139,41,66,0.4)" : "1px solid rgba(255,255,255,0.08)",
+                  color: activeZone === z ? "var(--al)" : "#8B7B72",
+                  display: "flex", alignItems: "center", gap: 4,
+                }}>
+                  <span style={{ fontSize: 13 }}>{zoneIcon(z)}</span> {z}
+                  {zoneScans[z] && <span style={{ fontFamily: "var(--mono)", fontSize: 9, color: activeZone === z ? "var(--al)" : "#6B5E55", marginLeft: 2 }}>✓</span>}
+                </button>
+              ))}
+              <button onClick={() => {
+                const name = prompt("New zone name:");
+                if (name && name.trim() && !zones.includes(name.trim())) {
+                  const next = [...zones, name.trim()];
+                  saveZones(next);
+                  setActiveZone(name.trim());
+                }
+              }} style={{
+                padding: "7px 12px", borderRadius: 8, fontFamily: "var(--mono)", fontSize: 11, fontWeight: 600, cursor: "pointer", minHeight: 34,
+                background: "rgba(255,255,255,0.02)", border: "1px dashed rgba(255,255,255,0.12)", color: "#6B5E55",
+              }}>+ Add</button>
+            </div>
+          </div>
+
+          <div style={S.viewfinder}>
+            <video ref={videoRef} style={S.video} playsInline muted />
+            <canvas ref={canvasRef} style={{ display: "none" }} />
+            {scanning && (
+              <div style={S.scanOverlay}>
+                <div style={S.scanLine}/>
+                <div style={{ position: "absolute", bottom: 16, left: 0, right: 0, textAlign: "center" }}>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "#FFF", background: "rgba(0,0,0,0.7)", padding: "6px 14px", borderRadius: 8, letterSpacing: 0.5 }}>
+                    {scanStage === "capturing" ? "📸 Capturing..." : "🔍 Analyzing..."}
+                  </span>
+                </div>
+              </div>
+            )}
+            {!streaming && (
+              <div style={S.camPlaceholder}>
+                <span style={{ fontSize: 44, marginBottom: 10 }}>📷</span>
+                <span style={{ fontFamily: "var(--sans)", fontSize: 15, color: "#8899AA", fontWeight: 600 }}>Tap to start camera</span>
+                <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#556677", marginTop: 3 }}>Point at shelves, fridges, or bar</span>
+              </div>
+            )}
+            {streaming && !scanning && [[["top","left"],["borderTop","borderLeft"]],[["top","right"],["borderTop","borderRight"]],[["bottom","left"],["borderBottom","borderLeft"]],[["bottom","right"],["borderBottom","borderRight"]]].map(([[v,h],[bv,bh]]) => (
+              <div key={v+h} style={{ position:"absolute",[v]:10,[h]:10,width:24,height:24,borderRadius:2,[bv]:"3px solid var(--al)",[bh]:"3px solid var(--al)"}} />
+            ))}
+          </div>
+
+          <div style={S.ctrlRow}>
+            {!streaming ? (
+              <button style={S.bigBtn} onClick={() => startCamera()}>Start Camera</button>
+            ) : (
+              <>
+                <button style={S.circBtn} onClick={flipCamera}>🔄</button>
+                <button style={{ ...S.bigBtn, flex:1, opacity: scanning?.5:1 }} onClick={() => doScan()} disabled={scanning}>
+                  {scanning ? (scanStage === "capturing" ? "📸 Capturing..." : "🔍 Analyzing...") : "⊙ Scan"}
+                </button>
+                <button style={S.circBtn} onClick={stopCamera}>✕</button>
+              </>
+            )}
+          </div>
+          {error && <div style={S.err}>⚠️ {error}</div>}
+          {debugImg && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <span style={{ fontFamily: "var(--mono)", fontSize: 9, color: "#8B7B72", textTransform: "uppercase", letterSpacing: 1 }}>Last captured frame</span>
+                <button onClick={() => setDebugImg(null)} style={{ background: "none", border: "none", color: "#8B7B72", fontSize: 10, fontFamily: "var(--mono)", cursor: "pointer" }}>✕ hide</button>
+              </div>
+              <img src={debugImg} style={{ width: "100%", borderRadius: 8, border: "1px solid rgba(255,255,255,0.1)" }} />
+              <div style={{ fontFamily: "var(--mono)", fontSize: 9, color: "#6B5E55", marginTop: 4 }}>
+                This is exactly what was sent to the AI. If it's black or blurry, that's the issue.
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══ RESULTS ═══ */}
+      {tab === "results" && (
+        <div style={S.page}>
+          {!results ? (
+            <div style={{ ...S.empty, marginTop: 40 }}>
+              <span style={{ fontSize: 40 }}>📷</span>
+              <span style={{ color: "#667788", fontSize: 14 }}>No scan yet</span>
+            </div>
+          ) : (
+            <>
+              {/* Top bar */}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                {viewingHistory !== null ? (
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 9, color: "var(--al)", background: "rgba(139,41,66,0.12)", padding: "3px 8px", borderRadius: 4, fontWeight: 700 }}>
+                    📅 {new Date(scanHistory[viewingHistory]?.timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" })} at {new Date(scanHistory[viewingHistory]?.timestamp).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+                  </span>
+                ) : (
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 9, color: "#667788" }}>Current scan</span>
+                )}
+                <button onClick={clearScan} style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#E74C3C", background: "rgba(231,76,60,0.08)", border: "1px solid rgba(231,76,60,0.2)", borderRadius: 8, padding: "6px 12px", cursor: "pointer", fontWeight: 700, minHeight: 32 }}>
+                  ✕ Clear
+                </button>
+              </div>
+
+              {/* Alert Banner */}
+              {uniqAlerts.length > 0 && (
+                <div style={S.alertBanner}>
+                  <div style={S.alertBannerHeader}>
+                    <span style={{ fontFamily: "var(--mono)", fontSize: 10, textTransform: "uppercase", letterSpacing: 1.5, color: "#E74C3C" }}>
+                      ⚠️ {uniqAlerts.length} issue{uniqAlerts.length > 1 ? "s" : ""} found
+                    </span>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {lowAlerts.length > 0 && <span style={S.alertPillLow}>📉 {lowAlerts.length} low</span>}
+                      {freshAlerts.length > 0 && <span style={S.alertPillFresh}>🕐 {freshAlerts.length} fresh</span>}
+                    </div>
+                  </div>
+                  <div style={S.alertList}>
+                    {uniqAlerts.map((a, i) => {
+                      const st = catStyle(a._cat);
+                      const fc = FC[a.fresh?.status || "ok"];
+                      return (
+                        <button key={i} style={S.alertItem} onClick={() => scrollToItem(a.pk, a._cat)}>
+                          <span style={{ fontSize: 14 }}>{a.alertType === "low" ? "📉" : (fc.icon || "⚠️")}</span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <span style={{ fontFamily: "var(--sans)", fontSize: 12, fontWeight: 600, color: "#E8EEF4" }}>{a.product} </span>
+                            <span style={{ fontFamily: "var(--mono)", fontSize: 9, color: st.c }}>{a.type}</span>
+                          </div>
+                          <span style={{ fontFamily: "var(--mono)", fontSize: 11, fontWeight: 700, color: a.alertType === "low" ? "#F1C40F" : fc.text, whiteSpace: "nowrap" }}>
+                            {a.alertType === "low" ? `${a.count}/${a.par}` : a.fresh?.label}
+                          </span>
+                          <span style={{ fontSize: 10, color: "#556677" }}>›</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Summary */}
+              <div style={S.summaryCard}>
+                <div style={S.label}>Scan Results</div>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 30, fontWeight: 700, color: "var(--al)" }}>{results.total}</span>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "#667788" }}>items</span>
+                </div>
+              </div>
+
+              {/* Confidence */}
+              {results.confidence != null && (() => {
+                const c = results.confidence;
+                const level = c >= 90 ? "high" : c >= 70 ? "medium" : "low";
+                const conf = {
+                  high:   { emoji: "🟢", label: "High confidence", color: "#2ECC71", bg: "rgba(46,204,113,0.08)", border: "rgba(46,204,113,0.2)" },
+                  medium: { emoji: "🟡", label: "Medium confidence", color: "#F1C40F", bg: "rgba(241,196,15,0.08)", border: "rgba(241,196,15,0.2)" },
+                  low:    { emoji: "🔴", label: "Low confidence", color: "#E74C3C", bg: "rgba(231,76,60,0.08)", border: "rgba(231,76,60,0.2)" },
+                }[level];
+                return (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: conf.bg, border: `1px solid ${conf.border}`, borderRadius: 10, marginBottom: 10 }}>
+                    <span style={{ fontSize: 16 }}>{conf.emoji}</span>
+                    <span style={{ fontFamily: "var(--mono)", fontSize: 11, fontWeight: 700, color: conf.color }}>{c}%</span>
+                    <span style={{ fontFamily: "var(--sans)", fontSize: 12, color: conf.color }}>{conf.label}</span>
+                    {level !== "high" && <span style={{ fontFamily: "var(--sans)", fontSize: 11, color: "#8B7B72", marginLeft: "auto" }}>Review flagged items</span>}
+                  </div>
+                );
+              })()}
+
+              {/* Review Flags */}
+              {results.reviewFlags && results.reviewFlags.length > 0 && (
+                <div style={{ background: "rgba(241,196,15,0.06)", border: "1px solid rgba(241,196,15,0.15)", borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
+                  <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#F1C40F", textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 8, fontWeight: 700 }}>👁️ Review needed</div>
+                  {results.reviewFlags.map((flag, i) => (
+                    <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 6, padding: "5px 0", borderBottom: i < results.reviewFlags.length - 1 ? "1px solid rgba(241,196,15,0.1)" : "none" }}>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#F1C40F", flexShrink: 0, marginTop: 1 }}>•</span>
+                      <span style={{ fontFamily: "var(--sans)", fontSize: 12, color: "#CCBB88", lineHeight: 1.4 }}>{flag}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Category chips */}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 5, margin: "0 0 10px" }}>
+                {(results.categories||[]).map(g => {
+                  const s = catStyle(g.category);
+                  return <span key={g.category} style={{ ...S.chip, background: s.bg, color: s.c, borderColor: s.c+"30" }}>{s.icon} {g.subtotal} {g.category}</span>;
+                })}
+              </div>
+
+              {/* Categories */}
+              {(results.categories||[]).length === 0 ? (
+                <div style={S.empty}><span style={{ fontSize: 28 }}>🔍</span><span style={{ color: "#8899AA", fontSize: 13 }}>No items detected</span></div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {results.categories.map((g, gi) => {
+                    const st = catStyle(g.category);
+                    const isColl = collapsed[g.category];
+                    const catAlertCount = uniqAlerts.filter(a => a._cat.toLowerCase() === g.category.toLowerCase()).length;
+                    return (
+                      <div key={g.category} style={{ ...S.catSec, animation: "slideUp .3s ease both", animationDelay: `${gi*50}ms` }}>
+                        <button style={S.catHead} onClick={() => toggle(g.category)}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                            <span style={{ fontSize: 18 }}>{st.icon}</span>
+                            <span style={{ fontFamily: "var(--sans)", fontSize: 14, fontWeight: 700, color: "#E8EEF4" }}>{g.category}</span>
+                            <span style={{ ...S.catBadge, background: st.bg, color: st.c }}>{g.subtotal}</span>
+                            {catAlertCount > 0 && <span style={S.catAlertDot}>⚠️ {catAlertCount}</span>}
+                          </div>
+                          <span style={{ color: "#556677", fontSize: 13, transform: isColl?"rotate(-90deg)":"rotate(0)", transition: "transform .15s" }}>▾</span>
+                        </button>
+                        {!isColl && (
+                          <div style={{ padding: "0 8px 8px" }}>
+                            {(g.items||[]).map((item, ii) => {
+                              const pk = parKey(item);
+                              const par = pars[pk];
+                              const isLow = par && item.count < par;
+                              const fresh = parseFreshness({ ...item, _cat: g.category });
+                              const fc = FC[fresh.status];
+                              const isEditing = editingPar === pk;
+                              const hasDanger = isLow || fresh.status === "danger" || fresh.status === "expired";
+                              const hasWarn = !hasDanger && fresh.status === "warning";
+
+                              return (
+                                <div key={ii} ref={el => { itemRefs.current[pk] = el; }} style={{
+                                  ...S.itemRow,
+                                  borderLeft: hasDanger ? "3px solid #E74C3C" : hasWarn ? "3px solid #F1C40F" : `3px solid ${st.c}33`,
+                                  background: hasDanger ? "rgba(231,76,60,0.06)" : hasWarn ? "rgba(241,196,15,0.04)" : "rgba(255,255,255,0.02)",
+                                  borderRadius: 10,
+                                }}>
+                                  <div style={{ flex: 1, minWidth: 0 }}>
+                                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                                      <span style={{ fontSize: 14 }}>{typeIcon(item.type)}</span>
+                                      <span style={S.prodName}>{item.product}</span>
+                                      <span style={{ ...S.typePill, background: st.c+"20", color: st.c, borderColor: st.c+"40" }}>{item.type}</span>
+                                    </div>
+                                    {item.details && <div style={S.detail}>{item.details}</div>}
+                                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 5 }}>
+                                      {fresh.status !== "ok" && (
+                                        <span style={{ ...S.flag, background: fc.bg, borderColor: fc.border, color: fc.text }}>
+                                          {fc.icon} {fresh.label}
+                                        </span>
+                                      )}
+                                      {isLow && <span style={S.lowFlag}>📉 Low ({item.count}/{par})</span>}
+                                      {!isEditing ? (
+                                        <button style={S.parBtn} onClick={() => { setEditingPar(pk); setParInput(par ? String(par) : ""); }}>
+                                          {par ? `Par: ${par}` : "+ Par"}
+                                        </button>
+                                      ) : (
+                                        <div style={{ display: "flex", gap: 4 }}>
+                                          <input type="number" value={parInput} onChange={e => setParInput(e.target.value)} placeholder="Par" style={S.parIn} autoFocus />
+                                          <button style={S.parOk} onClick={() => { const v = parseInt(parInput); if (v > 0) savePar(pk, v); setEditingPar(null); }}>✓</button>
+                                          <button style={S.parNo} onClick={() => setEditingPar(null)}>✕</button>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <span style={{ ...S.count, color: isLow ? "#E74C3C" : hasDanger ? "#E74C3C" : st.c }}>{item.count}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {results.notes && results.notes !== "No inventory items detected" && (
+                <div style={S.notes}>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 9, color: "#667788", textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 3 }}>Notes</span>
+                  <span style={{ fontFamily: "var(--sans)", fontSize: 12, color: "#AABBCC", lineHeight: 1.4 }}>{results.notes}</span>
+                </div>
+              )}
+
+              {/* Share Report */}
+              <button onClick={() => setShowReport(true)} style={{ marginTop: 16, width: "100%", padding: "14px", background: "linear-gradient(135deg, var(--accent), var(--al))", border: "none", borderRadius: 12, color: "#FFF", fontFamily: "var(--sans)", fontSize: 14, fontWeight: 700, cursor: "pointer", minHeight: 48, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                📋 Share Report
+              </button>
+
+              {/* Zone summary + Full Inventory + Reorder */}
+              {Object.keys(zoneScans).length > 0 && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#8B7B72", textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 8 }}>Scanned zones</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+                    {Object.entries(zoneScans).map(([z, zs]) => (
+                      <button key={z} onClick={() => {
+                        setResults({ categories: zs.categories, total: zs.total, notes: zs.notes });
+                        setViewingHistory(null);
+                      }} style={{
+                        display: "flex", alignItems: "center", gap: 5, padding: "8px 12px", borderRadius: 8,
+                        background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", cursor: "pointer", color: "inherit", minHeight: 36,
+                      }}>
+                        <span style={{ fontSize: 14 }}>{zoneIcon(z)}</span>
+                        <div style={{ textAlign: "left" }}>
+                          <div style={{ fontFamily: "var(--sans)", fontSize: 12, fontWeight: 600, color: "#EDE5DD" }}>{z}</div>
+                          <div style={{ fontFamily: "var(--mono)", fontSize: 9, color: "#8B7B72" }}>{zs.total} items</div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => {
+                      const full = getFullInventory();
+                      if (full) { setResults(full); setViewingHistory(null); }
+                    }} style={{ flex: 1, padding: "12px", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, color: "#EDE5DD", fontFamily: "var(--sans)", fontSize: 13, fontWeight: 600, cursor: "pointer", minHeight: 44, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                      🏢 Full Inventory
+                    </button>
+                    <button onClick={() => {
+                      const list = getReorderList();
+                      if (list.length === 0) { setError("Nothing below par — all stocked!"); setTimeout(() => setError(null), 3000); return; }
+                      setShowReport(true);
+                    }} style={{ flex: 1, padding: "12px", background: "rgba(231,76,60,0.08)", border: "1px solid rgba(231,76,60,0.2)", borderRadius: 10, color: "#E74C3C", fontFamily: "var(--sans)", fontSize: 13, fontWeight: 600, cursor: "pointer", minHeight: 44, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                      📦 Reorder List
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+          {error && tab === "results" && <div style={{ ...S.err, marginTop: 8 }}>⚠️ {error}</div>}
+        </div>
+      )}
+
+      {/* ═══ HISTORY ═══ */}
+      {tab === "history" && (
+        <div style={S.page}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#8B7B72", textTransform: "uppercase", letterSpacing: 1.8 }}>Scan History</span>
+            {scanHistory.length > 0 && (
+              <button onClick={() => { if(confirm("Clear all history?")) saveHistory([]); }} style={{ fontFamily: "var(--mono)", fontSize: 9, color: "#E74C3C", background: "rgba(231,76,60,0.08)", border: "1px solid rgba(231,76,60,0.2)", borderRadius: 6, padding: "4px 10px", cursor: "pointer" }}>
+                Clear all
+              </button>
+            )}
+          </div>
+
+          {scanHistory.length === 0 ? (
+            <div style={{ ...S.empty, marginTop: 30 }}>
+              <span style={{ fontSize: 40 }}>📅</span>
+              <span style={{ color: "#667788", fontSize: 14, fontFamily: "var(--sans)" }}>No scans yet</span>
+              <span style={{ color: "#555", fontSize: 12, fontFamily: "var(--sans)" }}>Scans are saved automatically</span>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {scanHistory.map((scan, idx) => {
+                const d = new Date(scan.timestamp);
+                const dayStr = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+                const timeStr = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+                const isToday = new Date().toDateString() === d.toDateString();
+                let deltaLabel = null;
+                if (idx < scanHistory.length - 1) {
+                  const prevTotal = scanHistory[idx + 1]?.total || 0;
+                  const diff = scan.total - prevTotal;
+                  if (diff !== 0) deltaLabel = { dir: diff > 0 ? "up" : "down", val: Math.abs(diff) };
+                }
+
+                return (
+                  <button key={scan.id || idx} onClick={() => viewHistoryScan(idx)} style={{
+                    display: "flex", alignItems: "center", gap: 10, padding: "12px", background: "rgba(255,255,255,0.02)",
+                    border: "1px solid rgba(255,255,255,0.04)", borderRadius: 12, cursor: "pointer", color: "inherit", width: "100%", textAlign: "left", minHeight: 56,
+                    animation: "slideUp .25s ease both", animationDelay: `${Math.min(idx, 10) * 40}ms`,
+                  }}>
+                    <div style={{ width: 42, height: 42, borderRadius: 10, background: isToday ? "rgba(139,41,66,0.15)" : "rgba(255,255,255,0.04)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 13, fontWeight: 700, color: isToday ? "var(--al)" : "#F5F0EB" }}>{d.getDate()}</span>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 8, color: isToday ? "var(--al)" : "#8B7B72", textTransform: "uppercase" }}>{d.toLocaleDateString("en-US", { month: "short" })}</span>
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontFamily: "var(--sans)", fontSize: 13, fontWeight: 600, color: "#EDE5DD" }}>{isToday ? "Today" : dayStr}</span>
+                        <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#8B7B72" }}>{timeStr}</span>
+                        {scan.zone && <span style={{ fontFamily: "var(--mono)", fontSize: 9, color: "var(--al)", background: "rgba(139,41,66,0.12)", padding: "1px 6px", borderRadius: 4 }}>{zoneIcon(scan.zone)} {scan.zone}</span>}
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 4 }}>
+                        {(scan.categories || []).slice(0, 4).map((g, gi) => {
+                          const st = catStyle(g.category);
+                          return <span key={gi} style={{ fontFamily: "var(--mono)", fontSize: 9, color: st.c, background: st.bg, padding: "1px 5px", borderRadius: 4 }}>{st.icon} {g.subtotal}</span>;
+                        })}
+                        {(scan.categories || []).length > 4 && <span style={{ fontFamily: "var(--mono)", fontSize: 9, color: "#8B7B72" }}>+{(scan.categories || []).length - 4}</span>}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", flexShrink: 0 }}>
+                      <span style={{ fontFamily: "var(--mono)", fontSize: 20, fontWeight: 700, color: "var(--al)" }}>{scan.total}</span>
+                      {deltaLabel && (
+                        <span style={{ fontFamily: "var(--mono)", fontSize: 9, fontWeight: 700, color: deltaLabel.dir === "down" ? "#E74C3C" : "#2ECC71" }}>
+                          {deltaLabel.dir === "down" ? "▼" : "▲"} {deltaLabel.val}
+                        </span>
+                      )}
+                    </div>
+                    <span style={{ fontSize: 12, color: "#556677", flexShrink: 0 }}>›</span>
+                  </button>
+                );
+              })}
+
+              {/* Trending */}
+              {scanHistory.length >= 2 && (() => {
+                const productMap = new Map();
+                scanHistory.slice(0, 10).forEach((scan, si) => {
+                  (scan.categories || []).forEach(g => {
+                    (g.items || []).forEach(item => {
+                      const pk = (item.product||"").toLowerCase() + "|" + (item.type||"").toLowerCase();
+                      if (!productMap.has(pk)) productMap.set(pk, { product: item.product, type: item.type, _cat: g.category, counts: [] });
+                      productMap.get(pk).counts[si] = item.count;
+                    });
+                  });
+                });
+                const movers = Array.from(productMap.values())
+                  .filter(p => p.counts.filter(c => c > 0).length >= 2)
+                  .map(p => {
+                    const recent = p.counts.find(c => c > 0) || 0;
+                    const older = [...p.counts].reverse().find(c => c > 0) || 0;
+                    return { ...p, recent, older, diff: older - recent };
+                  })
+                  .filter(p => p.diff !== 0)
+                  .sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff))
+                  .slice(0, 5);
+
+                if (movers.length === 0) return null;
+
+                return (
+                  <div style={{ marginTop: 12, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.04)", borderRadius: 12, padding: 12 }}>
+                    <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#8B7B72", textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 8 }}>Trending</div>
+                    {movers.map((m, i) => {
+                      const st = catStyle(m._cat);
+                      const isDown = m.diff > 0;
+                      return (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: i < movers.length - 1 ? "1px solid rgba(255,255,255,0.04)" : "none" }}>
+                          <span style={{ fontSize: 12 }}>{typeIcon(m.type)}</span>
+                          <span style={{ fontFamily: "var(--sans)", fontSize: 12, fontWeight: 600, color: "#EDE5DD", flex: 1 }}>{m.product}</span>
+                          <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#8B7B72" }}>{m.older} → {m.recent}</span>
+                          <span style={{ fontFamily: "var(--mono)", fontSize: 10, fontWeight: 700, color: isDown ? "#E74C3C" : "#2ECC71" }}>
+                            {isDown ? "▼" : "▲"}{Math.abs(m.diff)}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══ REPORT ═══ */}
+      {showReport && results && (() => {
+        const now = new Date();
+        const dStr = now.toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+        const tStr = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+        const tItems = results.total || 0;
+        const rItems = [];
+        const fItems = [];
+        (results.categories || []).forEach(g => {
+          (g.items || []).forEach(item => {
+            const pk = parKey(item);
+            const par = pars[pk];
+            const fresh = parseFreshness({ ...item, _cat: g.category });
+            if (par && item.count < par) rItems.push({ ...item, _cat: g.category, par, need: par - item.count });
+            if (fresh.status !== "ok") fItems.push({ ...item, _cat: g.category, fresh });
+          });
+        });
+
+        const doShare = () => {
+          let text = `━━━━━━━━━━━━━━━━━━━━━━\nAberScan Report\n${dStr} at ${tStr}\n━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+          text += `📊 ${tItems} total items\n`;
+          if (rItems.length > 0) text += `🔴 ${rItems.length} items need restock\n`;
+          if (fItems.length > 0) text += `⚠️ ${fItems.length} freshness issues\n`;
+          text += `\n`;
+          if (rItems.length > 0) {
+            text += `🔴 RESTOCK NEEDED\n─────────────────\n`;
+            rItems.forEach(i => { text += `  ${i.product} [${i.type}]\n    On hand: ${i.count} → Par: ${i.par} → Need: ${i.need}\n`; });
+            text += `\n`;
+          }
+          if (fItems.length > 0) {
+            text += `⚠️ FRESHNESS CHECK\n─────────────────\n`;
+            fItems.forEach(i => { text += `  ${i.product} [${i.type}] — ${i.fresh?.label || "check"}\n`; });
+            text += `\n`;
+          }
+          (results.categories || []).forEach(g => {
+            text += `${catStyle(g.category).icon} ${g.category.toUpperCase()} (${g.subtotal})\n─────────────────\n`;
+            (g.items || []).forEach(i => {
+              const pk2 = parKey(i);
+              const par2 = pars[pk2];
+              let line = `  ${i.product} [${i.type}] — ${i.count}`;
+              if (par2) line += ` (par: ${par2})`;
+              if (i.details) line += `\n    ${i.details}`;
+              text += line + `\n`;
+            });
+            text += `\n`;
+          });
+          if (results.notes && results.notes !== "No inventory items detected") text += `📝 ${results.notes}\n\n`;
+          text += `━━━━━━━━━━━━━━━━━━━━━━\nGenerated by AberScan\nThe Aberdeen Tap`;
+          if (navigator.share) {
+            navigator.share({ title: "AberScan Report", text }).catch(() => {});
+          } else {
+            try { navigator.clipboard.writeText(text); alert("Copied!"); } catch(e) {}
+          }
+        };
+
+        const rs = {
+          wrap: { position:"fixed", inset:0, zIndex:100, background:"#FAFAF8", overflowY:"auto", WebkitOverflowScrolling:"touch", paddingTop:"env(safe-area-inset-top, 0px)" },
+          inner: { maxWidth:480, margin:"0 auto", padding:"20px 16px 40px", fontFamily:"'DM Sans',sans-serif", color:"#1A1A1A" },
+          bar: { display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 },
+          cb: { background:"#F0EEEA", border:"none", borderRadius:8, padding:"8px 14px", fontSize:13, fontWeight:600, color:"#555", cursor:"pointer", minHeight:36 },
+          sb: { background:"#8B2942", border:"none", borderRadius:8, padding:"8px 16px", fontSize:13, fontWeight:700, color:"#FFF", cursor:"pointer", minHeight:36 },
+          hd: { textAlign:"center", marginBottom:24, paddingBottom:20, borderBottom:"1px solid #E8E5E0" },
+          sr: { display:"flex", gap:8, marginBottom:20 },
+          sx: { flex:1, background:"#F5F3F0", borderRadius:10, padding:"12px 10px", textAlign:"center" },
+          sn: { fontFamily:"'Space Mono',monospace", fontSize:24, fontWeight:700, display:"block" },
+          sl: { fontFamily:"'Space Mono',monospace", fontSize:9, color:"#888", textTransform:"uppercase", letterSpacing:1.5, marginTop:2, display:"block" },
+          ab: { background:"#FFF5F5", border:"1px solid #FED7D7", borderRadius:10, padding:"12px 14px", marginBottom:16 },
+          at: { fontFamily:"'Space Mono',monospace", fontSize:10, fontWeight:700, color:"#C53030", textTransform:"uppercase", letterSpacing:1.5, marginBottom:8 },
+          ai: { display:"flex", justifyContent:"space-between", alignItems:"center", padding:"6px 0", borderBottom:"1px solid #FEE2E2" },
+          wb: { background:"#FFFFF0", border:"1px solid #FEFCBF", borderRadius:10, padding:"12px 14px", marginBottom:16 },
+          wt: { fontFamily:"'Space Mono',monospace", fontSize:10, fontWeight:700, color:"#B7791F", textTransform:"uppercase", letterSpacing:1.5, marginBottom:8 },
+          wi: { display:"flex", justifyContent:"space-between", alignItems:"center", padding:"6px 0", borderBottom:"1px solid #FEFCBF" },
+          ct: { display:"flex", alignItems:"center", gap:8, padding:"10px 0", borderBottom:"2px solid #E8E5E0", marginBottom:8 },
+          rw: { display:"flex", alignItems:"center", padding:"8px 0", borderBottom:"1px solid #F0EEEA", gap:8 },
+        };
+
+        return (
+          <div style={rs.wrap}>
+            <div style={rs.inner}>
+              <div style={rs.bar}>
+                <button style={rs.cb} onClick={() => setShowReport(false)}>← Back</button>
+                <button style={rs.sb} onClick={doShare}>Share 📤</button>
+              </div>
+              <div style={rs.hd}>
+                <div><span style={{ fontFamily:"'Playfair Display',serif", fontSize:22, fontWeight:800, color:"#1A1A1A" }}>Aber</span><span style={{ fontFamily:"'Space Mono',monospace", fontSize:18, fontWeight:700, color:"#8B2942" }}>Scan</span></div>
+                <div style={{ fontFamily:"'Space Mono',monospace", fontSize:10, color:"#999", textTransform:"uppercase", letterSpacing:2.5, marginTop:6 }}>Inventory Report</div>
+                <div style={{ fontSize:13, color:"#666", marginTop:4 }}>{dStr} at {tStr}</div>
+              </div>
+              <div style={rs.sr}>
+                <div style={rs.sx}><span style={{ ...rs.sn, color:"#1A1A1A" }}>{tItems}</span><span style={rs.sl}>Total</span></div>
+                <div style={rs.sx}><span style={{ ...rs.sn, color:"#1A1A1A" }}>{(results.categories||[]).length}</span><span style={rs.sl}>Categories</span></div>
+                <div style={rs.sx}><span style={{ ...rs.sn, color: rItems.length > 0 ? "#C53030" : "#2F855A" }}>{rItems.length}</span><span style={rs.sl}>Low stock</span></div>
+                <div style={rs.sx}><span style={{ ...rs.sn, color: fItems.length > 0 ? "#B7791F" : "#2F855A" }}>{fItems.length}</span><span style={rs.sl}>Fresh</span></div>
+              </div>
+              {rItems.length > 0 && (
+                <div style={rs.ab}>
+                  <div style={rs.at}>🔴 Restock needed</div>
+                  {rItems.map((item, i) => (
+                    <div key={i} style={{ ...rs.ai, borderBottom: i === rItems.length-1 ? "none" : "1px solid #FEE2E2" }}>
+                      <div><span style={{ fontSize:13, fontWeight:600 }}>{item.product}</span> <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#888", background:"#F0EEEA", padding:"2px 6px", borderRadius:4 }}>{item.type}</span></div>
+                      <span style={{ fontFamily:"'Space Mono',monospace", fontSize:11, color:"#C53030", fontWeight:700 }}>Need {item.need}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {fItems.length > 0 && (
+                <div style={rs.wb}>
+                  <div style={rs.wt}>⚠️ Freshness check</div>
+                  {fItems.map((item, i) => (
+                    <div key={i} style={{ ...rs.wi, borderBottom: i === fItems.length-1 ? "none" : "1px solid #FEFCBF" }}>
+                      <div><span style={{ fontSize:13, fontWeight:600 }}>{item.product}</span> <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#888", background:"#F0EEEA", padding:"2px 6px", borderRadius:4 }}>{item.type}</span></div>
+                      <span style={{ fontFamily:"'Space Mono',monospace", fontSize:11, color:"#B7791F", fontWeight:700 }}>{item.fresh?.label || "check"}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {(results.categories || []).map((g, gi) => (
+                <div key={gi} style={{ marginBottom:16 }}>
+                  <div style={rs.ct}>
+                    <span style={{ fontSize:16 }}>{catStyle(g.category).icon}</span>
+                    <span style={{ fontSize:15, fontWeight:700 }}>{g.category}</span>
+                    <span style={{ fontFamily:"'Space Mono',monospace", fontSize:12, fontWeight:700, color:"#888", background:"#F0EEEA", padding:"2px 8px", borderRadius:6 }}>{g.subtotal}</span>
+                  </div>
+                  {(g.items || []).map((item, ii) => {
+                    const pk = parKey(item);
+                    const par = pars[pk];
+                    const isLow = par && item.count < par;
+                    return (
+                      <div key={ii} style={{ ...rs.rw, background: isLow ? "#FFF5F5" : "transparent" }}>
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+                            <span style={{ fontSize:13, fontWeight:600, color:"#333" }}>{item.product}</span>
+                            <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#888", background:"#F0EEEA", padding:"2px 6px", borderRadius:4, textTransform:"uppercase", fontWeight:700 }}>{item.type}</span>
+                            {par && <span style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#888" }}>par:{par}</span>}
+                          </div>
+                          {item.details && <div style={{ fontSize:11, color:"#999", marginTop:2 }}>{item.details}</div>}
+                        </div>
+                        <span style={{ fontFamily:"'Space Mono',monospace", fontSize:18, fontWeight:700, color: isLow ? "#C53030" : "#1A1A1A", minWidth:36, textAlign:"right" }}>{item.count}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+              {results.notes && results.notes !== "No inventory items detected" && (
+                <div style={{ background:"#F5F3F0", borderRadius:10, padding:"12px 14px", marginTop:12 }}>
+                  <div style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#888", textTransform:"uppercase", letterSpacing:1.5, marginBottom:4 }}>Notes</div>
+                  <div style={{ fontSize:13, color:"#555", lineHeight:1.5 }}>{results.notes}</div>
+                </div>
+              )}
+              <div style={{ textAlign:"center", padding:"20px 0", borderTop:"1px solid #E8E5E0", marginTop:20 }}>
+                <div style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:"#BBB", textTransform:"uppercase", letterSpacing:2 }}>Generated by AberScan • The Aberdeen Tap</div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+/* ── STYLES ── */
+const S = {
+  root: { "--sans":"'DM Sans',sans-serif", "--mono":"'Space Mono',monospace", "--accent":"#8B2942", "--al":"#A83355", minHeight:"100dvh", background:"#110E0C", fontFamily:"var(--sans)", color:"#F5F0EB", display:"flex", flexDirection:"column", maxWidth:480, margin:"0 auto" },
+  header: { display:"flex", justifyContent:"space-between", alignItems:"center", padding:"max(14px, env(safe-area-inset-top, 14px)) 16px 6px", position:"sticky", top:0, zIndex:20, background:"#110E0C" },
+  tabBar: { display:"flex", padding:"0 12px 6px", gap:4, position:"sticky", top:52, zIndex:20, background:"#110E0C" },
+  tabBtn: { flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:2, padding:"8px 4px", background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.05)", borderRadius:10, color:"#6B5E55", fontFamily:"var(--sans)", cursor:"pointer", position:"relative", minHeight:48, justifyContent:"center" },
+  tabAct: { background:"rgba(139,41,66,.12)", borderColor:"rgba(139,41,66,.3)", color:"var(--al)" },
+  tabBadge: { position:"absolute", top:3, right:6, fontFamily:"var(--mono)", fontSize:8, fontWeight:700, color:"#FFF", padding:"1px 5px", borderRadius:8, minWidth:16, textAlign:"center" },
+  page: { flex:1, padding:"8px 12px 32px", display:"flex", flexDirection:"column" },
+  viewfinder: { width:"100%", aspectRatio:"4/3", background:"#1A1411", borderRadius:16, overflow:"hidden", position:"relative", border:"1px solid rgba(255,255,255,.06)" },
+  video: { width:"100%", height:"100%", objectFit:"cover", display:"block" },
+  camPlaceholder: { position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" },
+  scanOverlay: { position:"absolute", inset:0, background:"rgba(139,41,66,.06)" },
+  scanLine: { position:"absolute", left:0, right:0, height:2, background:"linear-gradient(90deg,transparent,var(--al),transparent)", boxShadow:"0 0 16px var(--accent)", animation:"scanLine 1.8s ease-in-out infinite alternate" },
+  ctrlRow: { display:"flex", gap:10, marginTop:10 },
+  bigBtn: { width:"100%", padding:"14px 20px", background:"linear-gradient(135deg,var(--accent),var(--al))", border:"none", borderRadius:12, color:"#FFF", fontFamily:"var(--sans)", fontSize:15, fontWeight:700, cursor:"pointer", minHeight:48 },
+  circBtn: { width:48, height:48, minWidth:48, background:"rgba(255,255,255,.06)", border:"1px solid rgba(255,255,255,.1)", borderRadius:12, color:"#F5F0EB", fontSize:18, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" },
+  err: { marginTop:8, background:"rgba(231,76,60,.1)", border:"1px solid rgba(231,76,60,.25)", borderRadius:10, padding:"10px 14px", fontSize:12, color:"#E74C3C" },
+  alertBanner: { background:"rgba(231,76,60,0.06)", border:"1px solid rgba(231,76,60,0.2)", borderRadius:14, padding:"10px 12px", marginBottom:10, animation:"slideUp .3s ease" },
+  alertBannerHeader: { display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 },
+  alertPillLow: { fontFamily:"var(--mono)", fontSize:9, fontWeight:700, padding:"2px 7px", borderRadius:4, background:"rgba(241,196,15,.12)", border:"1px solid rgba(241,196,15,.3)", color:"#F1C40F" },
+  alertPillFresh: { fontFamily:"var(--mono)", fontSize:9, fontWeight:700, padding:"2px 7px", borderRadius:4, background:"rgba(231,76,60,.12)", border:"1px solid rgba(231,76,60,.3)", color:"#E74C3C" },
+  alertList: { display:"flex", flexDirection:"column", gap:3 },
+  alertItem: { display:"flex", alignItems:"center", gap:7, padding:"7px 8px", background:"rgba(255,255,255,0.03)", borderRadius:8, border:"none", cursor:"pointer", color:"inherit", width:"100%", textAlign:"left", minHeight:40 },
+  summaryCard: { display:"flex", justifyContent:"space-between", alignItems:"center", background:"rgba(255,255,255,.03)", borderRadius:14, padding:"12px 14px", marginBottom:10, border:"1px solid rgba(255,255,255,.05)" },
+  label: { fontFamily:"var(--mono)", fontSize:10, color:"#8B7B72", textTransform:"uppercase", letterSpacing:1.8 },
+  chip: { fontFamily:"var(--mono)", fontSize:10, padding:"3px 8px", borderRadius:6, border:"1px solid", whiteSpace:"nowrap", fontWeight:600 },
+  catSec: { background:"rgba(255,255,255,.02)", borderRadius:12, overflow:"hidden", border:"1px solid rgba(255,255,255,.04)" },
+  catHead: { width:"100%", display:"flex", justifyContent:"space-between", alignItems:"center", padding:"11px 12px", background:"transparent", border:"none", cursor:"pointer", color:"inherit", minHeight:44 },
+  catBadge: { fontFamily:"var(--mono)", fontSize:11, fontWeight:700, padding:"1px 7px", borderRadius:5 },
+  catAlertDot: { fontFamily:"var(--mono)", fontSize:9, color:"#E74C3C", background:"rgba(231,76,60,.12)", padding:"1px 6px", borderRadius:4, animation:"alertFlash 2s ease infinite" },
+  itemRow: { display:"flex", alignItems:"flex-start", padding:"10px 8px", marginBottom:4, gap:8 },
+  prodName: { fontFamily:"var(--sans)", fontSize:13, fontWeight:600, color:"#EDE5DD", lineHeight:1.2 },
+  typePill: { fontFamily:"var(--mono)", fontSize:9, padding:"1px 6px", borderRadius:4, border:"1px solid", textTransform:"uppercase", letterSpacing:.7, whiteSpace:"nowrap", fontWeight:700 },
+  detail: { fontFamily:"var(--sans)", fontSize:11, color:"#8B7B72", lineHeight:1.2, marginTop:3 },
+  count: { fontFamily:"var(--mono)", fontSize:22, fontWeight:700, flexShrink:0 },
+  flag: { fontFamily:"var(--mono)", fontSize:9, fontWeight:700, padding:"2px 7px", borderRadius:4, border:"1px solid", whiteSpace:"nowrap" },
+  lowFlag: { fontFamily:"var(--mono)", fontSize:9, fontWeight:700, padding:"2px 7px", borderRadius:4, background:"rgba(241,196,15,.12)", border:"1px solid rgba(241,196,15,.35)", color:"#F1C40F", whiteSpace:"nowrap" },
+  parBtn: { fontFamily:"var(--mono)", fontSize:9, padding:"3px 8px", borderRadius:4, background:"rgba(255,255,255,.05)", border:"1px solid rgba(255,255,255,.1)", color:"#8B7B72", cursor:"pointer", whiteSpace:"nowrap", minHeight:24 },
+  parIn: { width:50, fontFamily:"var(--mono)", fontSize:11, padding:"3px 6px", borderRadius:4, background:"rgba(255,255,255,.08)", border:"1px solid rgba(139,41,66,.4)", color:"#F5F0EB", outline:"none", minHeight:24 },
+  parOk: { fontFamily:"var(--mono)", fontSize:12, padding:"2px 8px", borderRadius:4, background:"rgba(139,41,66,.2)", border:"1px solid rgba(139,41,66,.4)", color:"var(--al)", cursor:"pointer", fontWeight:700, minHeight:24 },
+  parNo: { fontFamily:"var(--mono)", fontSize:12, padding:"2px 8px", borderRadius:4, background:"rgba(255,255,255,.05)", border:"1px solid rgba(255,255,255,.1)", color:"#6B5E55", cursor:"pointer", minHeight:24 },
+  notes: { marginTop:12, padding:10, background:"rgba(255,255,255,.02)", borderRadius:8, border:"1px solid rgba(255,255,255,.04)", display:"flex", flexDirection:"column" },
+  empty: { display:"flex", flexDirection:"column", alignItems:"center", padding:"20px 0", gap:6 },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
